@@ -1,5 +1,5 @@
 # =============================================================================
-# Learning Debt simulation, v13d
+# Learning Debt simulation
 # Fast, restartable deployment-calibrated simulation with expanded baselines and score-unit sensitivity
 #
 # This script is meant to be run with Rscript, not inside an interactive
@@ -20,16 +20,12 @@
 #
 # Environment variables:
 #   LD_RUN_MODE    smoke | paper | full     Default: paper
-#   LD_OUTPUT_DIR  output directory         Default: ~/learning_debt_sim_outputs_v13d
+#   LD_OUTPUT_DIR  output directory         Default: ~/
 #   LD_RESUME      1 or 0                   Default: 1
 #   LD_N_CAL       override calibration paths per scenario cell
 #   LD_N_TUNE      override tuning paths per scenario cell
 #   LD_N_TEST      override test paths per scenario cell
 #
-# Example:
-#   Rscript learning_debt_sim_v13d_sensitivity.R
-#   LD_RUN_MODE=smoke Rscript learning_debt_sim_v13d_sensitivity.R
-#   LD_RUN_MODE=full Rscript learning_debt_sim_v13d_sensitivity.R
 # =============================================================================
 
 options(stringsAsFactors = FALSE)
@@ -89,7 +85,6 @@ N_TUNE_PATHS_PER_CELL <- get_env_int("LD_N_TUNE", N_TUNE_PATHS_PER_CELL)
 N_TEST_PATHS_PER_CELL <- get_env_int("LD_N_TEST", N_TEST_PATHS_PER_CELL)
 
 # Expanded candidate grids. These are deliberately wider than v13c because the
-# v13c tuning output put calendar and CUSUM at grid-boundary values.
 CAL_INTERVALS        <- c(1L, 2L, 3L, 5L, 10L, 20L, 40L, 80L)
 CUSUM_THRESHOLDS     <- c(0.01, 0.025, 0.05, 0.10, 0.20, 0.50, 1, 2, 4, 8, 16)
 ALARM_QUANTILES      <- c(0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.975)

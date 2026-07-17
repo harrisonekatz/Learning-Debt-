@@ -1,0 +1,7 @@
+"score_unit_mode","target_label","target_policy","benchmark_label","benchmark_policy","n_cells","cell_wins","wins_label","mean_relative","ci_025","ci_975","median_relative","iqr_25","iqr_75"
+"q75","Age-adjusted debt threshold","debt_threshold_tuned","Tuned calendar","calendar_tuned",72,72,"72/72",0.66250311188372,0.659857708408996,0.666009350385994,0.660184883605996,0.630511326782051,0.691986407849358
+"q75","Age-adjusted debt threshold","debt_threshold_tuned","Tuned CUSUM","cusum_tuned",72,61,"61/72",0.966659745912726,0.964821745939389,0.968847525412081,0.957306457260951,0.940659624807091,0.977159313260472
+"q75","Debt utility","debt_utility_tuned","Tuned calendar","calendar_tuned",72,66,"66/72",0.780780657551217,0.775057547898433,0.788501349605802,0.773874307828076,0.688961512378848,0.857166632419558
+"q75","Debt utility","debt_utility_tuned","Tuned CUSUM","cusum_tuned",72,6,"6/72",1.14330014417343,1.13472837121936,1.15375827029925,1.07361098740523,1.03527030480762,1.20377743980144
+"q75","Hybrid utility","hybrid_utility_tuned","Tuned calendar","calendar_tuned",72,71,"71/72",0.779891136752938,0.774657332139961,0.786799342697767,0.799505929790972,0.688390100087414,0.867393975527035
+"q75","Hybrid utility","hybrid_utility_tuned","Tuned CUSUM","cusum_tuned",72,2,"2/72",1.14119507753706,1.13388450599119,1.15047685118881,1.08868680797411,1.05361004559385,1.20205806164876

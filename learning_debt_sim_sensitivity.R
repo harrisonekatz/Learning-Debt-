@@ -35,8 +35,45 @@ options(stringsAsFactors = FALSE)
 # =============================================================================
 
 RUN_MODE <- tolower(Sys.getenv("LD_RUN_MODE", unset = "paper"))
-default_output <- file.path(path.expand("~"), paste0("learning_debt_sim_outputs_v13d_", RUN_MODE))
-OUTPUT_DIR <- path.expand(Sys.getenv("LD_OUTPUT_DIR", unset = default_output))
+
+# ---- Regret accounting (reviewer point 2) -----------------------------------
+REGRET_REQUEST <- tolower(Sys.getenv("LD_REGRET_MODE", unset = ""))
+if (nzchar(REGRET_REQUEST) && !REGRET_REQUEST %in% c("positive", "signed")) REGRET_REQUEST <- ""
+REGRET_MODE <- if (nzchar(REGRET_REQUEST)) REGRET_REQUEST else "positive"
+
+# ---- Data-generating process: continuous misspecification knobs -------------
+# generate_path() reads three continuous knobs. Their off values reproduce the
+# Gaussian, linear, homoskedastic process (and the original RNG stream) exactly.
+#   DGP_TAIL_DF    Inf  -> Gaussian ; finite > 2 -> Student-t, variance matched
+#   DGP_HET_THETA  0    -> homoskedastic ; > 0 -> sd grows with |x|, avg var fixed
+#   DGP_NL_COEF    0    -> linear mean ; > 0 -> static quadratic curvature
+DGP_ALL <- c("wellspec", "student_t", "heteroskedastic", "nonlinear")
+DGP_REQUEST <- tolower(Sys.getenv("LD_DGP_MODE", unset = "all"))
+if (!DGP_REQUEST %in% c("all", DGP_ALL)) DGP_REQUEST <- "all"
+DGP_MODE <- "wellspec"
+DGP_TAIL_DF   <- suppressWarnings(as.numeric(Sys.getenv("LD_DGP_TAIL_DF",   unset = "Inf")))
+DGP_HET_THETA <- suppressWarnings(as.numeric(Sys.getenv("LD_DGP_HET_THETA", unset = "0")))
+DGP_NL_COEF   <- suppressWarnings(as.numeric(Sys.getenv("LD_DGP_NL_COEF",   unset = "0")))
+if (!is.finite(DGP_HET_THETA)) DGP_HET_THETA <- 0
+if (!is.finite(DGP_NL_COEF))   DGP_NL_COEF <- 0
+
+# Map the discrete modes (used by the grid / outer-MC entrypoints) onto knobs.
+set_dgp_knobs <- function(mode) {
+  DGP_TAIL_DF <<- Inf; DGP_HET_THETA <<- 0; DGP_NL_COEF <<- 0
+  if (identical(mode, "student_t"))            DGP_TAIL_DF <<- 4
+  else if (identical(mode, "heteroskedastic")) DGP_HET_THETA <<- 1
+  else if (identical(mode, "nonlinear"))       DGP_NL_COEF <<- 0.4
+  invisible(NULL)
+}
+
+# ---- Frontier sweep severity grids (editable) -------------------------------
+# Each axis runs from its off value outward. "severity" in the output is the raw
+# knob value, so for tail it DECREASES into the heavy-tailed regime.
+TAIL_LEVELS <- c(Inf, 8, 6, 5, 4, 3)     # Student-t df: Inf = Gaussian; dense near the df 5-8 crossing
+HET_LEVELS  <- c(0, 0.5, 1, 1.5, 2, 4)   # heteroskedasticity strength; dense near theta ~ 1
+NL_LEVELS   <- c(0, 0.4, 0.8)            # static curvature (negative control; trend is monotone, coarse is fine)
+
+OUTPUT_ROOT <- path.expand(Sys.getenv("LD_OUTPUT_DIR", unset = path.expand("~")))
 RESUME <- Sys.getenv("LD_RESUME", unset = "1") != "0"
 
 T_PERIODS <- 200L
@@ -84,6 +121,37 @@ N_CAL_PATHS_PER_CELL  <- get_env_int("LD_N_CAL",  N_CAL_PATHS_PER_CELL)
 N_TUNE_PATHS_PER_CELL <- get_env_int("LD_N_TUNE", N_TUNE_PATHS_PER_CELL)
 N_TEST_PATHS_PER_CELL <- get_env_int("LD_N_TEST", N_TEST_PATHS_PER_CELL)
 
+# ---- Mode selection: frontier (default) > outer-MC > single-pass grid -------
+parse_int0 <- function(name, default) {
+  x <- Sys.getenv(name, unset = "")
+  if (nchar(x) == 0) return(default)
+  y <- suppressWarnings(as.integer(x)); if (is.na(y) || y < 0L) default else y
+}
+FRONTIER_ON   <- Sys.getenv("LD_FRONTIER", unset = "1") != "0"   # reviewer point 3, made continuous
+FRONTIER_REPS <- parse_int0("LD_FRONTIER_REPS", 8L)              # reps per sweep point (publication bands; lower for a quick pass)
+OUTER_REPS    <- parse_int0("LD_OUTER_REPS", 15L)                # reviewer point 4
+
+if (RUN_MODE == "smoke") {
+  FRONTIER_REPS <- min(FRONTIER_REPS, 2L)
+  OUTER_REPS    <- min(OUTER_REPS, 3L)
+  TAIL_LEVELS <- c(Inf, 4); HET_LEVELS <- c(0, 1); NL_LEVELS <- c(0, 0.4)
+}
+
+# Inner experiment size per pipeline pass, by mode (LD_N_* always wins).
+set_inner <- function(name, val) if (!nzchar(Sys.getenv(name))) val else NULL
+if (RUN_MODE != "smoke") {
+  if (FRONTIER_ON) {
+    if (!nzchar(Sys.getenv("LD_N_CAL")))  N_CAL_PATHS_PER_CELL  <- 8L
+    if (!nzchar(Sys.getenv("LD_N_TUNE"))) N_TUNE_PATHS_PER_CELL <- 6L
+    if (!nzchar(Sys.getenv("LD_N_TEST"))) N_TEST_PATHS_PER_CELL <- 10L
+  } else if (OUTER_REPS > 0L) {
+    if (!nzchar(Sys.getenv("LD_N_CAL")))  N_CAL_PATHS_PER_CELL  <- 12L
+    if (!nzchar(Sys.getenv("LD_N_TUNE"))) N_TUNE_PATHS_PER_CELL <- 8L
+    if (!nzchar(Sys.getenv("LD_N_TEST"))) N_TEST_PATHS_PER_CELL <- 20L
+  }
+}
+SEED_REP_OFFSET <- 0L
+
 # Expanded candidate grids. These are deliberately wider than v13c because the
 CAL_INTERVALS        <- c(1L, 2L, 3L, 5L, 10L, 20L, 40L, 80L)
 CUSUM_THRESHOLDS     <- c(0.01, 0.025, 0.05, 0.10, 0.20, 0.50, 1, 2, 4, 8, 16)
@@ -101,7 +169,7 @@ SEED_ILLUS_BASE <- 440000L
 
 PRIOR <- list(mu_0 = 0, kappa_0 = 1, alpha_0 = 2, beta_0 = 1)
 
-dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+# OUTPUT_DIR is created per run inside run_pipeline() / run_outer_mc() / run_frontier().
 
 log_msg <- function(...) {
   cat(sprintf(...), "\n")
@@ -195,7 +263,7 @@ safe_action <- function(x) {
 make_seed <- function(base, shift_type, shift_prob, sim_id) {
   st_id <- match(shift_type, SHIFT_TYPES)
   sp_id <- match(shift_prob, SHIFT_PROBS)
-  as.integer(base + 100000L * st_id + 10000L * sp_id + sim_id)
+  as.integer(base + 100000L * st_id + 10000L * sp_id + sim_id + SEED_REP_OFFSET)
 }
 
 append_csv <- function(df, file) {
@@ -261,9 +329,33 @@ generate_path <- function(T, shift_prob, shift_type) {
   xu <- make_matrix(N_UPDATE)
   xm <- make_matrix(N_MONITOR)
   xe <- make_matrix(N_EVAL)
-  yu <- beta_vec * xu + sqrt(sigma2_vec) * make_matrix(N_UPDATE)
-  ym <- beta_vec * xm + sqrt(sigma2_vec) * make_matrix(N_MONITOR)
-  ye <- beta_vec * xe + sqrt(sigma2_vec) * make_matrix(N_EVAL)
+
+  # Mean: linear unless DGP_NL_COEF != 0 (static curvature the linear model
+  # cannot see). The (x^2 - 1) term is mean-zero at x ~ N(0,1).
+  add_nl <- function(m, xmat) if (DGP_NL_COEF != 0) m + DGP_NL_COEF * (xmat * xmat - 1) else m
+  mean_u <- add_nl(beta_vec * xu, xu)
+  mean_m <- add_nl(beta_vec * xm, xm)
+  mean_e <- add_nl(beta_vec * xe, xe)
+
+  # Error law: Gaussian when DGP_TAIL_DF is Inf (same RNG stream as the original,
+  # so wellspec reproduces exactly); Student-t, variance matched, otherwise.
+  draw_noise <- function(n) {
+    if (is.finite(DGP_TAIL_DF) && DGP_TAIL_DF > 2) {
+      sqrt((DGP_TAIL_DF - 2) / DGP_TAIL_DF) * matrix(rt(T * n, df = DGP_TAIL_DF), nrow = T, ncol = n)
+    } else {
+      matrix(rnorm(T * n), nrow = T, ncol = n)
+    }
+  }
+  # Error scale: constant unless DGP_HET_THETA > 0, where sd grows with |x| while
+  # the average variance is preserved (E[x^2] = 1).
+  het_scale <- function(xmat) {
+    if (DGP_HET_THETA > 0) sqrt((1 + DGP_HET_THETA * xmat * xmat) / (1 + DGP_HET_THETA)) else 1
+  }
+
+  sd_vec <- sqrt(sigma2_vec)
+  yu <- mean_u + sd_vec * het_scale(xu) * draw_noise(N_UPDATE)
+  ym <- mean_m + sd_vec * het_scale(xm) * draw_noise(N_MONITOR)
+  ye <- mean_e + sd_vec * het_scale(xe) * draw_noise(N_EVAL)
 
   x0 <- rnorm(N_INIT)
   y0 <- rnorm(N_INIT)
@@ -305,7 +397,7 @@ compute_features <- function(shadow_post, dep_post, path, t, spell_age) {
     param_gap = abs(shadow_post$mu_0 - dep_post$mu_0),
     resid_exceed = resid_exceed,
     eval_score_gap = eval_gap,
-    regret_eval = max(eval_gap, 0)
+    regret_eval = if (identical(REGRET_MODE, "signed")) eval_gap else max(eval_gap, 0)
   )
 }
 
@@ -1365,143 +1457,455 @@ make_figures <- function(policy_summary, relative_summary, cal_df_adj, illustrat
 # 10. Main workflow
 # =============================================================================
 
-log_msg("=== Learning Debt v13d expanded-grid sensitivity simulation ===")
-log_msg("Run mode: %s", RUN_MODE)
-log_msg("Output directory: %s", OUTPUT_DIR)
-log_msg("Resume: %s", ifelse(RESUME, "yes", "no"))
-log_msg("T=%d, N_INIT=%d, update=%d, monitor=%d, eval=%d", T_PERIODS, N_INIT, N_UPDATE, N_MONITOR, N_EVAL)
-log_msg("Paths per cell: calibration=%d, tuning=%d, test=%d", N_CAL_PATHS_PER_CELL, N_TUNE_PATHS_PER_CELL, N_TEST_PATHS_PER_CELL)
+run_pipeline <- function(regret_mode, dgp_mode) {
+  REGRET_MODE <<- regret_mode
+  DGP_MODE <<- dgp_mode
+  set_dgp_knobs(dgp_mode)
+  suffix <- if (dgp_mode == "wellspec") "" else paste0("_", dgp_mode)
+  OUTPUT_DIR <<- file.path(OUTPUT_ROOT,
+    paste0("learning_debt_sim_outputs_v13d_", RUN_MODE, "_", regret_mode, suffix))
+  dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
-calibration_rows <- collect_calibration_rows(N_CAL_PATHS_PER_CELL)
-age_adjuster <- fit_age_adjuster(calibration_rows)
-calibration_rows_adj <- add_calibrated_features(calibration_rows, age_adjuster)
-utility_models <- fit_utility_models(calibration_rows_adj)
+  log_msg("=== Learning Debt v13d expanded-grid sensitivity simulation ===")
+  log_msg("Run mode: %s", RUN_MODE)
+  log_msg("Output directory: %s", OUTPUT_DIR)
+  log_msg("Resume: %s", ifelse(RESUME, "yes", "no"))
+  log_msg("T=%d, N_INIT=%d, update=%d, monitor=%d, eval=%d", T_PERIODS, N_INIT, N_UPDATE, N_MONITOR, N_EVAL)
+  log_msg("Paths per cell: calibration=%d, tuning=%d, test=%d", N_CAL_PATHS_PER_CELL, N_TUNE_PATHS_PER_CELL, N_TEST_PATHS_PER_CELL)
 
-score_units_df <- build_score_units(calibration_rows_adj)
-candidate_grid <- build_candidate_grid(calibration_rows_adj)
-tune_out <- tune_policies(candidate_grid, score_units_df, age_adjuster, utility_models, N_TUNE_PATHS_PER_CELL)
-boundary_summary <- make_boundary_summary(tune_out$tuned_params, candidate_grid)
-all_runs <- run_test_grid(tune_out$tuned_params, score_units_df, age_adjuster, utility_models, N_TEST_PATHS_PER_CELL)
-summary_out <- make_summaries(all_runs)
+  calibration_rows <- collect_calibration_rows(N_CAL_PATHS_PER_CELL)
+  age_adjuster <- fit_age_adjuster(calibration_rows)
+  calibration_rows_adj <- add_calibrated_features(calibration_rows, age_adjuster)
+  utility_models <- fit_utility_models(calibration_rows_adj)
 
-# Illustrative path under the primary 75th-percentile score-unit mode.
-set.seed(make_seed(SEED_ILLUS_BASE, "abrupt_coef", 0.05, 1L))
-illustrative_path <- generate_path(T_PERIODS, 0.05, "abrupt_coef")
-primary_mode <- "q75"
-primary_score_unit <- score_units_df$score_unit[score_units_df$score_unit_mode == primary_mode][1]
-if (!is.finite(primary_score_unit)) primary_score_unit <- score_units_df$score_unit[1]
-illustrative_lambda <- 1.0 * primary_score_unit
-illustrative_scale <- get_tuned_value(tune_out$tuned_params, primary_mode, 1.0, "hybrid_utility", 1)
-illustrative_res <- simulate_policy(illustrative_path, "hybrid_utility", illustrative_lambda,
-                                    age_adjuster, utility_models, illustrative_scale, TRUE)
-illustrative_series <- illustrative_res$series
-illustrative_series$shift_type <- "abrupt_coef"
-illustrative_series$shift_prob <- 0.05
-illustrative_series$kappa <- 1.0
-illustrative_series$score_unit_mode <- primary_mode
+  score_units_df <- build_score_units(calibration_rows_adj)
+  candidate_grid <- build_candidate_grid(calibration_rows_adj)
+  tune_out <- tune_policies(candidate_grid, score_units_df, age_adjuster, utility_models, N_TUNE_PATHS_PER_CELL)
+  boundary_summary <- make_boundary_summary(tune_out$tuned_params, candidate_grid)
+  all_runs <- run_test_grid(tune_out$tuned_params, score_units_df, age_adjuster, utility_models, N_TEST_PATHS_PER_CELL)
+  summary_out <- make_summaries(all_runs)
 
-# Save outputs.
-write.csv(calibration_rows_adj, checkpoint_file("calibration_rows_v13d.csv"), row.names = FALSE)
-write.csv(score_units_df, checkpoint_file("score_units_v13d.csv"), row.names = FALSE)
-write.csv(candidate_grid, checkpoint_file("candidate_grid_v13d.csv"), row.names = FALSE)
-write.csv(tune_out$tuning_summary, checkpoint_file("tuning_summary_v13d.csv"), row.names = FALSE)
-write.csv(tune_out$tuned_params, checkpoint_file("tuned_parameters_v13d.csv"), row.names = FALSE)
-write.csv(boundary_summary, checkpoint_file("boundary_summary_v13d.csv"), row.names = FALSE)
-write.csv(summary_out$policy_summary, checkpoint_file("policy_summary_v13d.csv"), row.names = FALSE)
-write.csv(summary_out$relative_summary, checkpoint_file("relative_summary_v13d.csv"), row.names = FALSE)
-write.csv(summary_out$cell_win_summary, checkpoint_file("cell_win_summary_v13d.csv"), row.names = FALSE)
-write.csv(summary_out$replicate_win_summary, checkpoint_file("replicate_win_summary_v13d.csv"), row.names = FALSE)
-write.csv(summary_out$score_unit_sensitivity, checkpoint_file("score_unit_sensitivity_summary_v13d.csv"), row.names = FALSE)
-write.csv(summary_out$primary_table1_q75, checkpoint_file("table1_primary_q75_v13d.csv"), row.names = FALSE)
-write.csv(illustrative_series, checkpoint_file("illustrative_series_v13d.csv"), row.names = FALSE)
+  # Illustrative path under the primary 75th-percentile score-unit mode.
+  set.seed(make_seed(SEED_ILLUS_BASE, "abrupt_coef", 0.05, 1L))
+  illustrative_path <- generate_path(T_PERIODS, 0.05, "abrupt_coef")
+  primary_mode <- "q75"
+  primary_score_unit <- score_units_df$score_unit[score_units_df$score_unit_mode == primary_mode][1]
+  if (!is.finite(primary_score_unit)) primary_score_unit <- score_units_df$score_unit[1]
+  illustrative_lambda <- 1.0 * primary_score_unit
+  illustrative_scale <- get_tuned_value(tune_out$tuned_params, primary_mode, 1.0, "hybrid_utility", 1)
+  illustrative_res <- simulate_policy(illustrative_path, "hybrid_utility", illustrative_lambda,
+                                      age_adjuster, utility_models, illustrative_scale, TRUE)
+  illustrative_series <- illustrative_res$series
+  illustrative_series$shift_type <- "abrupt_coef"
+  illustrative_series$shift_prob <- 0.05
+  illustrative_series$kappa <- 1.0
+  illustrative_series$score_unit_mode <- primary_mode
 
-writeLines(capture.output(summary(age_adjuster$model)), checkpoint_file("age_adjuster_summary_v13d.txt"))
-writeLines(capture.output(summary(utility_models$debt_model)), checkpoint_file("debt_utility_model_summary_v13d.txt"))
-writeLines(capture.output(summary(utility_models$hybrid_model)), checkpoint_file("hybrid_utility_model_summary_v13d.txt"))
-writeLines(capture.output(sessionInfo()), checkpoint_file("session_info_v13d.txt"))
+  # Save outputs.
+  write.csv(calibration_rows_adj, checkpoint_file("calibration_rows_v13d.csv"), row.names = FALSE)
+  write.csv(score_units_df, checkpoint_file("score_units_v13d.csv"), row.names = FALSE)
+  write.csv(candidate_grid, checkpoint_file("candidate_grid_v13d.csv"), row.names = FALSE)
+  write.csv(tune_out$tuning_summary, checkpoint_file("tuning_summary_v13d.csv"), row.names = FALSE)
+  write.csv(tune_out$tuned_params, checkpoint_file("tuned_parameters_v13d.csv"), row.names = FALSE)
+  write.csv(boundary_summary, checkpoint_file("boundary_summary_v13d.csv"), row.names = FALSE)
+  write.csv(summary_out$policy_summary, checkpoint_file("policy_summary_v13d.csv"), row.names = FALSE)
+  write.csv(summary_out$relative_summary, checkpoint_file("relative_summary_v13d.csv"), row.names = FALSE)
+  write.csv(summary_out$cell_win_summary, checkpoint_file("cell_win_summary_v13d.csv"), row.names = FALSE)
+  write.csv(summary_out$replicate_win_summary, checkpoint_file("replicate_win_summary_v13d.csv"), row.names = FALSE)
+  write.csv(summary_out$score_unit_sensitivity, checkpoint_file("score_unit_sensitivity_summary_v13d.csv"), row.names = FALSE)
+  write.csv(summary_out$primary_table1_q75, checkpoint_file("table1_primary_q75_v13d.csv"), row.names = FALSE)
+  write.csv(illustrative_series, checkpoint_file("illustrative_series_v13d.csv"), row.names = FALSE)
 
-make_figures(summary_out$policy_summary, summary_out$relative_summary, calibration_rows_adj, illustrative_series)
+  writeLines(capture.output(summary(age_adjuster$model)), checkpoint_file("age_adjuster_summary_v13d.txt"))
+  writeLines(capture.output(summary(utility_models$debt_model)), checkpoint_file("debt_utility_model_summary_v13d.txt"))
+  writeLines(capture.output(summary(utility_models$hybrid_model)), checkpoint_file("hybrid_utility_model_summary_v13d.txt"))
+  writeLines(capture.output(sessionInfo()), checkpoint_file("session_info_v13d.txt"))
 
-readme_lines <- c(
-  "Learning Debt simulation outputs, v13d",
-  "",
-  paste0("Run mode: ", RUN_MODE),
-  paste0("T_PERIODS: ", T_PERIODS),
-  paste0("Calibration paths per scenario cell: ", N_CAL_PATHS_PER_CELL),
-  paste0("Tuning paths per scenario cell: ", N_TUNE_PATHS_PER_CELL),
-  paste0("Test paths per scenario cell: ", N_TEST_PATHS_PER_CELL),
-  "",
-  "Design summary:",
-  "- Warm-started deployed and shadow posteriors.",
-  "- Separate update, monitor, and evaluation batches.",
-  "- Period-t actions affect period t+1 and later.",
-  "- Objective is lambda times retrain count plus accumulated positive evaluation score gap.",
-  "- Exact KL between NIG shadow and deployed posteriors is the debt signal.",
-  "- Debt is age-adjusted using stable no-shift calibration paths.",
-  "- Utility-calibrated debt and hybrid policies are tuned on calibration paths and evaluated on held-out paths.",
-  "- Calendar, CUSUM, alarm, debt-threshold, always-retrain, and never-retrain baselines are included.",
-  "- v13d expands the grids because v13c placed some baselines at boundary values.",
-  "- Score-unit sensitivity is run for median, q75, and mean positive predictive-regret units.",
-  "- The script checkpoints calibration, tuning, and held-out test paths and can resume after interruption.",
-  "",
-  "Expanded grids:",
-  paste0("- Calendar intervals: ", paste(CAL_INTERVALS, collapse = ", ")),
-  paste0("- CUSUM thresholds: ", paste(CUSUM_THRESHOLDS, collapse = ", ")),
-  paste0("- Alarm quantiles: ", paste(ALARM_QUANTILES, collapse = ", ")),
-  paste0("- Utility scales: ", paste(UTILITY_SCALES, collapse = ", ")),
-  paste0("- Debt-threshold quantiles: ", paste(DEBT_THRESHOLD_PROBS, collapse = ", ")),
-  "",
-  "Main files:",
-  "- all_runs_v13d.csv",
-  "- policy_summary_v13d.csv",
-  "- relative_summary_v13d.csv",
-  "- cell_win_summary_v13d.csv",
-  "- replicate_win_summary_v13d.csv",
-  "- score_unit_sensitivity_summary_v13d.csv",
-  "- table1_primary_q75_v13d.csv",
-  "- tuning_summary_v13d.csv",
-  "- tuned_parameters_v13d.csv",
-  "- boundary_summary_v13d.csv",
-  "- calibration_rows_v13d.csv",
-  "- score_units_v13d.csv",
-  "- session_info_v13d.txt"
-)
-writeLines(readme_lines, checkpoint_file("README_v13d.txt"))
+  make_figures(summary_out$policy_summary, summary_out$relative_summary, calibration_rows_adj, illustrative_series)
 
-log_msg("=== v13d complete. Outputs written to %s ===", OUTPUT_DIR)
+  readme_lines <- c(
+    "Learning Debt simulation outputs, v13d",
+    "",
+    paste0("Run mode: ", RUN_MODE),
+    paste0("T_PERIODS: ", T_PERIODS),
+    paste0("Calibration paths per scenario cell: ", N_CAL_PATHS_PER_CELL),
+    paste0("Tuning paths per scenario cell: ", N_TUNE_PATHS_PER_CELL),
+    paste0("Test paths per scenario cell: ", N_TEST_PATHS_PER_CELL),
+    "",
+    "Design summary:",
+    "- Warm-started deployed and shadow posteriors.",
+    "- Separate update, monitor, and evaluation batches.",
+    "- Period-t actions affect period t+1 and later.",
+    sprintf("- Objective is lambda times retrain count plus accumulated %s evaluation score gap.",
+            if (identical(REGRET_MODE, "signed")) "signed" else "positive"),
+    sprintf("- DGP knobs: tail_df=%s, het_theta=%s, nl_coef=%s (NIG model + exact KL unchanged).",
+            format(DGP_TAIL_DF), format(DGP_HET_THETA), format(DGP_NL_COEF)),
+    "- Exact KL between NIG shadow and deployed posteriors is the debt signal.",
+    "- Debt is age-adjusted using stable no-shift calibration paths.",
+    "- Utility-calibrated debt and hybrid policies are tuned on calibration paths and evaluated on held-out paths.",
+    "- Calendar, CUSUM, alarm, debt-threshold, always-retrain, and never-retrain baselines are included.",
+    "- v13d expands the grids because v13c placed some baselines at boundary values.",
+    "- Score-unit sensitivity is run for median, q75, and mean positive predictive-regret units.",
+    "- The script checkpoints calibration, tuning, and held-out test paths and can resume after interruption.",
+    "",
+    "Expanded grids:",
+    paste0("- Calendar intervals: ", paste(CAL_INTERVALS, collapse = ", ")),
+    paste0("- CUSUM thresholds: ", paste(CUSUM_THRESHOLDS, collapse = ", ")),
+    paste0("- Alarm quantiles: ", paste(ALARM_QUANTILES, collapse = ", ")),
+    paste0("- Utility scales: ", paste(UTILITY_SCALES, collapse = ", ")),
+    paste0("- Debt-threshold quantiles: ", paste(DEBT_THRESHOLD_PROBS, collapse = ", ")),
+    "",
+    "Main files:",
+    "- all_runs_v13d.csv",
+    "- policy_summary_v13d.csv",
+    "- relative_summary_v13d.csv",
+    "- cell_win_summary_v13d.csv",
+    "- replicate_win_summary_v13d.csv",
+    "- score_unit_sensitivity_summary_v13d.csv",
+    "- table1_primary_q75_v13d.csv",
+    "- tuning_summary_v13d.csv",
+    "- tuned_parameters_v13d.csv",
+    "- boundary_summary_v13d.csv",
+    "- calibration_rows_v13d.csv",
+    "- score_units_v13d.csv",
+    "- session_info_v13d.txt"
+  )
+  writeLines(readme_lines, checkpoint_file("README_v13d.txt"))
 
-cat("\n--- Score units ---\n")
-print(score_units_df, row.names = FALSE)
+  log_msg("=== v13d complete. Outputs written to %s ===", OUTPUT_DIR)
 
-cat("\n--- Tuned parameters ---\n")
-print(tune_out$tuned_params[order(tune_out$tuned_params$score_unit_mode,
-                                  tune_out$tuned_params$kappa,
-                                  tune_out$tuned_params$policy), ], row.names = FALSE)
+  cat("\n--- Score units ---\n")
+  print(score_units_df, row.names = FALSE)
 
-cat("\n--- Boundary summary ---\n")
-print(boundary_summary[order(boundary_summary$score_unit_mode,
-                             boundary_summary$kappa,
-                             boundary_summary$policy), ], row.names = FALSE)
+  cat("\n--- Tuned parameters ---\n")
+  print(tune_out$tuned_params[order(tune_out$tuned_params$score_unit_mode,
+                                    tune_out$tuned_params$kappa,
+                                    tune_out$tuned_params$policy), ], row.names = FALSE)
 
-cat("\n--- Primary Table 1 summary, q75 score-unit mode ---\n")
-print(summary_out$primary_table1_q75, row.names = FALSE)
+  cat("\n--- Boundary summary ---\n")
+  print(boundary_summary[order(boundary_summary$score_unit_mode,
+                               boundary_summary$kappa,
+                               boundary_summary$policy), ], row.names = FALSE)
 
-cat("\n--- Cell win summary, non-stable cells ---\n")
-print(summary_out$cell_win_summary[order(summary_out$cell_win_summary$score_unit_mode,
-                                         summary_out$cell_win_summary$target_policy,
-                                         summary_out$cell_win_summary$benchmark,
-                                         summary_out$cell_win_summary$shift_type), ], row.names = FALSE)
+  cat("\n--- Primary Table 1 summary, q75 score-unit mode ---\n")
+  print(summary_out$primary_table1_q75, row.names = FALSE)
 
-cat("\n--- Mean relative objectives by score-unit mode and shift type ---\n")
-rel <- summary_out$relative_summary[summary_out$relative_summary$shift_type != "none", ]
-for (mode in unique(rel$score_unit_mode)) {
-  for (st in unique(rel$shift_type)) {
-    tmp <- rel[rel$score_unit_mode == mode & rel$shift_type == st, ]
-    cat(sprintf("%s / %s: debt/calendar=%.3f, hybrid/calendar=%.3f, debt/CUSUM=%.3f, hybrid/CUSUM=%.3f\n",
-                mode, st,
-                mean(tmp$rel_debt_utility_vs_calendar, na.rm = TRUE),
-                mean(tmp$rel_hybrid_utility_vs_calendar, na.rm = TRUE),
-                mean(tmp$rel_debt_utility_vs_cusum, na.rm = TRUE),
-                mean(tmp$rel_hybrid_utility_vs_cusum, na.rm = TRUE)))
+  cat("\n--- Cell win summary, non-stable cells ---\n")
+  print(summary_out$cell_win_summary[order(summary_out$cell_win_summary$score_unit_mode,
+                                           summary_out$cell_win_summary$target_policy,
+                                           summary_out$cell_win_summary$benchmark,
+                                           summary_out$cell_win_summary$shift_type), ], row.names = FALSE)
+
+  cat("\n--- Mean relative objectives by score-unit mode and shift type ---\n")
+  rel <- summary_out$relative_summary[summary_out$relative_summary$shift_type != "none", ]
+  for (mode in unique(rel$score_unit_mode)) {
+    for (st in unique(rel$shift_type)) {
+      tmp <- rel[rel$score_unit_mode == mode & rel$shift_type == st, ]
+      cat(sprintf("%s / %s: debt/calendar=%.3f, hybrid/calendar=%.3f, debt/CUSUM=%.3f, hybrid/CUSUM=%.3f\n",
+                  mode, st,
+                  mean(tmp$rel_debt_utility_vs_calendar, na.rm = TRUE),
+                  mean(tmp$rel_hybrid_utility_vs_calendar, na.rm = TRUE),
+                  mean(tmp$rel_debt_utility_vs_cusum, na.rm = TRUE),
+                  mean(tmp$rel_hybrid_utility_vs_cusum, na.rm = TRUE)))
+    }
+  }
+}
+
+# =============================================================================
+# 11. Headline extraction + outer Monte Carlo loop (reviewer point 4)
+# =============================================================================
+headline_from_relative <- function(rel) {
+  rel <- rel[rel$shift_type != "none", , drop = FALSE]
+  modes <- c("median", "q75", "mean")
+  getcol <- function(df, nm) if (nm %in% names(df)) df[[nm]] else rep(NA_real_, nrow(df))
+  rows <- vector("list", length(modes))
+  for (i in seq_along(modes)) {
+    sdf <- rel[rel$score_unit_mode == modes[i], , drop = FALSE]
+    tt  <- getcol(sdf, "obj_debt_threshold_tuned")
+    uu  <- getcol(sdf, "obj_cusum_tuned")
+    cc  <- getcol(sdf, "obj_calendar_tuned")
+    ok_u <- is.finite(tt) & is.finite(uu) & uu > 0
+    ok_c <- is.finite(tt) & is.finite(cc) & cc > 0
+    rows[[i]] <- data.frame(
+      score_unit_mode   = modes[i],
+      n_cells           = sum(ok_u),
+      dt_cusum_win      = if (any(ok_u)) mean(tt[ok_u] < uu[ok_u]) else NA_real_,
+      dt_cusum_ratio    = if (any(ok_u)) mean(tt[ok_u] / uu[ok_u]) else NA_real_,
+      dt_calendar_win   = if (any(ok_c)) mean(tt[ok_c] < cc[ok_c]) else NA_real_,
+      dt_calendar_ratio = if (any(ok_c)) mean(tt[ok_c] / cc[ok_c]) else NA_real_,
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, rows)
+}
+
+# One full calibrate -> tune -> evaluate pass in out_dir. Returns the headline
+# (debt_threshold vs CUSUM and vs calendar, by scaling) plus two observable
+# regime diagnostics read off the calibration monitoring stream.
+pipeline_headline_once <- function(out_dir) {
+  OUTPUT_DIR <<- out_dir
+  dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+  cal_rows <- collect_calibration_rows(N_CAL_PATHS_PER_CELL)
+  age_adj  <- fit_age_adjuster(cal_rows)
+  cal_adj  <- add_calibrated_features(cal_rows, age_adj)
+  util_mod <- fit_utility_models(cal_adj)
+  su_df    <- build_score_units(cal_adj)
+  cand_g   <- build_candidate_grid(cal_adj)
+  tune_o   <- tune_policies(cand_g, su_df, age_adj, util_mod, N_TUNE_PATHS_PER_CELL)
+  all_runs <- run_test_grid(tune_o$tuned_params, su_df, age_adj, util_mod, N_TEST_PATHS_PER_CELL)
+  pol_sum <- summarise_by_group(all_runs,
+    c("score_unit_mode", "score_unit", "kappa", "lambda", "shift_prob", "shift_type", "policy"))
+  rel <- make_relative_summary(pol_sum)
+  hl <- headline_from_relative(rel)
+  egap <- cal_adj$eval_score_gap[is.finite(cal_adj$eval_score_gap)]
+  hl$frac_deployed_better <- if (length(egap) > 0L) mean(egap < 0) else NA_real_
+  hl$mean_sqrt_debt <- mean(cal_adj$sqrt_debt[is.finite(cal_adj$sqrt_debt)], na.rm = TRUE)
+  hl
+}
+
+aggregate_outer_mc <- function(per_rep) {
+  modes <- c("median", "q75", "mean")
+  qf <- function(x, p) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else as.numeric(stats::quantile(x, p, names = FALSE, type = 7)) }
+  rows <- vector("list", length(modes))
+  for (i in seq_along(modes)) {
+    sdf <- per_rep[per_rep$score_unit_mode == modes[i], , drop = FALSE]
+    w  <- sdf$dt_cusum_win;    r  <- sdf$dt_cusum_ratio
+    cw <- sdf$dt_calendar_win; cr <- sdf$dt_calendar_ratio
+    rows[[i]] <- data.frame(
+      score_unit_mode = modes[i], n_reps = nrow(sdf),
+      dt_cusum_win_mean = mean(w, na.rm = TRUE), dt_cusum_win_sd = stats::sd(w, na.rm = TRUE),
+      dt_cusum_win_q05 = qf(w, 0.05), dt_cusum_win_q50 = qf(w, 0.50), dt_cusum_win_q95 = qf(w, 0.95),
+      dt_cusum_ratio_mean = mean(r, na.rm = TRUE), dt_cusum_ratio_sd = stats::sd(r, na.rm = TRUE),
+      dt_cusum_ratio_q05 = qf(r, 0.05), dt_cusum_ratio_q50 = qf(r, 0.50), dt_cusum_ratio_q95 = qf(r, 0.95),
+      dt_calendar_win_mean = mean(cw, na.rm = TRUE), dt_calendar_ratio_mean = mean(cr, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, rows)
+}
+
+run_outer_mc <- function(regret_mode, dgp_mode, n_reps, keep_scratch = FALSE) {
+  REGRET_MODE <<- regret_mode
+  DGP_MODE <<- dgp_mode
+  set_dgp_knobs(dgp_mode)
+  cell_tag <- paste0(regret_mode, if (dgp_mode == "wellspec") "" else paste0("_", dgp_mode))
+  cell_root <- file.path(OUTPUT_ROOT,
+    paste0("learning_debt_sim_outputs_v13d_", RUN_MODE, "_", cell_tag, "_outermc"))
+  dir.create(cell_root, showWarnings = FALSE, recursive = TRUE)
+  per_rep_file <- file.path(cell_root, "outer_mc_per_rep_v13d.csv")
+  done_file <- file.path(cell_root, "outer_mc_done_reps_v13d.rds")
+  done <- if (RESUME && file.exists(done_file)) readRDS(done_file) else integer(0)
+  log_msg("[outer-mc] cell=%s : %d reps, inner cal=%d tune=%d test=%d",
+          cell_tag, n_reps, N_CAL_PATHS_PER_CELL, N_TUNE_PATHS_PER_CELL, N_TEST_PATHS_PER_CELL)
+  for (rep in seq_len(n_reps)) {
+    if (rep %in% done) { log_msg("[outer-mc] cell=%s rep=%d done, skip", cell_tag, rep); next }
+    SEED_REP_OFFSET <<- as.integer(rep) * 1000000L
+    hl <- pipeline_headline_once(file.path(cell_root, sprintf("rep_%03d", rep)))
+    hl$rep <- rep; hl$regret_mode <- regret_mode; hl$dgp_mode <- dgp_mode
+    append_csv(hl, per_rep_file)
+    done <- c(done, rep); saveRDS(done, done_file)
+    if (!keep_scratch) unlink(file.path(cell_root, sprintf("rep_%03d", rep)), recursive = TRUE, force = TRUE)
+    log_msg("[outer-mc] cell=%s rep=%d / %d done", cell_tag, rep, n_reps)
+  }
+  if (!file.exists(per_rep_file)) return(invisible(NULL))
+  per_rep <- read.csv(per_rep_file, stringsAsFactors = FALSE)
+  per_rep <- per_rep[!duplicated(per_rep[, c("rep", "score_unit_mode")]), , drop = FALSE]
+  agg <- aggregate_outer_mc(per_rep); agg$regret_mode <- regret_mode; agg$dgp_mode <- dgp_mode
+  write.csv(agg, file.path(cell_root, "outer_mc_summary_v13d.csv"), row.names = FALSE)
+  cat(sprintf("\n=== outer MC: regret=%s dgp=%s (%d reps) ===\n", regret_mode, dgp_mode, max(per_rep$rep)))
+  for (i in seq_len(nrow(agg))) {
+    a <- agg[i, ]
+    cat(sprintf("  %-7s vs CUSUM: win %.0f%% (sd %.1f, 5-95: %.0f-%.0f)  ratio %.3f (5-95: %.3f-%.3f)\n",
+                a$score_unit_mode, 100*a$dt_cusum_win_mean, 100*a$dt_cusum_win_sd,
+                100*a$dt_cusum_win_q05, 100*a$dt_cusum_win_q95,
+                a$dt_cusum_ratio_mean, a$dt_cusum_ratio_q05, a$dt_cusum_ratio_q95))
+  }
+  invisible(agg)
+}
+
+# =============================================================================
+# 12. Frontier sweep (continuous version of reviewer point 3)
+# =============================================================================
+# Walks one misspecification axis at a time from its off value outward, running
+# FRONTIER_REPS full pipeline passes per point (same seed stream across severity
+# levels = common random numbers, so the comparison across severities is clean).
+# Records the headline by scaling plus two observable regime diagnostics:
+#   frac_deployed_better : share of eval batches where the frozen model beat the
+#                          shadow (near 0 when well specified, rises with tails)
+#   mean_sqrt_debt       : average size of the posterior-divergence signal
+aggregate_frontier <- function(pr) {
+  qf <- function(x, p) { x <- x[is.finite(x)]; if (length(x) == 0L) NA_real_ else as.numeric(stats::quantile(x, p, names = FALSE, type = 7)) }
+  key <- paste(pr$axis, pr$severity, pr$score_unit_mode, sep = "|")
+  groups <- split(pr, key)
+  rows <- lapply(groups, function(g) {
+    data.frame(
+      axis = g$axis[1], severity = g$severity[1], score_unit_mode = g$score_unit_mode[1], n_reps = nrow(g),
+      dt_cusum_win_mean = mean(g$dt_cusum_win, na.rm = TRUE), dt_cusum_win_sd = stats::sd(g$dt_cusum_win, na.rm = TRUE),
+      dt_cusum_ratio_mean = mean(g$dt_cusum_ratio, na.rm = TRUE), dt_cusum_ratio_sd = stats::sd(g$dt_cusum_ratio, na.rm = TRUE),
+      dt_cusum_ratio_q05 = qf(g$dt_cusum_ratio, 0.05), dt_cusum_ratio_q95 = qf(g$dt_cusum_ratio, 0.95),
+      dt_calendar_ratio_mean = mean(g$dt_calendar_ratio, na.rm = TRUE),
+      frac_deployed_better = mean(g$frac_deployed_better, na.rm = TRUE),
+      mean_sqrt_debt = mean(g$mean_sqrt_debt, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+  out <- do.call(rbind, rows)
+  out[order(out$axis, out$severity, match(out$score_unit_mode, c("median", "q75", "mean"))), ]
+}
+
+frontier_crossings <- function(agg) {
+  # For each axis x scaling, find where the debt-vs-CUSUM mean ratio drops below
+  # one as misspecification deepens, and whether the 5-95 band clears one there.
+  modes <- c("median", "q75", "mean")
+  sev_rank <- function(ax, sev) if (identical(ax, "tail")) -sev else sev  # deeper = smaller df / larger theta or coef
+  out <- list(); k <- 0L
+  for (ax in unique(agg$axis)) {
+    for (m in modes) {
+      g <- agg[agg$axis == ax & agg$score_unit_mode == m, , drop = FALSE]
+      if (nrow(g) < 2L) next
+      g <- g[order(sev_rank(ax, g$severity)), , drop = FALSE]
+      r <- g$dt_cusum_ratio_mean
+      from_sev <- NA_real_; to_sev <- NA_real_; band_ex1 <- NA
+      for (i in seq_len(nrow(g) - 1L)) {
+        if (is.finite(r[i]) && is.finite(r[i + 1L]) && r[i] >= 1 && r[i + 1L] < 1) {
+          from_sev <- g$severity[i]; to_sev <- g$severity[i + 1L]
+          band_ex1 <- isTRUE(g$dt_cusum_ratio_q95[i + 1L] < 1)
+          break
+        }
+      }
+      bi <- which.min(r)
+      k <- k + 1L
+      out[[k]] <- data.frame(
+        axis = ax, score_unit_mode = m,
+        crosses = is.finite(from_sev),
+        cross_from_severity = from_sev, cross_to_severity = to_sev,
+        win_band_excludes_one_at_cross = band_ex1,
+        best_severity = if (length(bi)) g$severity[bi] else NA_real_,
+        best_ratio = if (length(bi)) r[bi] else NA_real_,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  do.call(rbind, out)
+}
+
+run_frontier <- function(regret_mode, n_reps, keep_scratch = FALSE) {
+  REGRET_MODE <<- regret_mode
+  root <- file.path(OUTPUT_ROOT,
+    paste0("learning_debt_sim_outputs_v13d_", RUN_MODE, "_", regret_mode, "_frontier"))
+  dir.create(root, showWarnings = FALSE, recursive = TRUE)
+  per_rep_file <- file.path(root, "frontier_per_rep_v13d.csv")
+  done_file <- file.path(root, "frontier_done_v13d.rds")
+  done <- if (RESUME && file.exists(done_file)) readRDS(done_file) else character(0)
+
+  axes <- trimws(strsplit(Sys.getenv("LD_FRONTIER_AXES", unset = "tail,hetero,nonlinear"), ",", fixed = TRUE)[[1]])
+  axes <- axes[nzchar(axes)]
+  levels_for <- function(ax) {
+    if (ax == "tail")      return(TAIL_LEVELS)
+    if (ax == "hetero")    return(HET_LEVELS)
+    if (ax == "nonlinear") return(NL_LEVELS)
+    numeric(0)
+  }
+
+  log_msg("[frontier] regret=%s axes={%s} reps=%d inner cal=%d tune=%d test=%d",
+          regret_mode, paste(axes, collapse = ","), n_reps,
+          N_CAL_PATHS_PER_CELL, N_TUNE_PATHS_PER_CELL, N_TEST_PATHS_PER_CELL)
+
+  for (ax in axes) {
+    lv <- levels_for(ax)
+    for (val in lv) {
+      DGP_TAIL_DF <<- Inf; DGP_HET_THETA <<- 0; DGP_NL_COEF <<- 0
+      if (ax == "tail")      DGP_TAIL_DF   <<- val
+      if (ax == "hetero")    DGP_HET_THETA <<- val
+      if (ax == "nonlinear") DGP_NL_COEF   <<- val
+      DGP_MODE <<- sprintf("%s=%s", ax, format(val))
+      vtag <- gsub("[^0-9A-Za-z]", "_", format(val, digits = 6))
+      reps_here <- if (ax == "nonlinear") max(3L, as.integer(ceiling(n_reps / 2))) else n_reps
+      for (rep in seq_len(reps_here)) {
+        tag <- paste(ax, format(val, digits = 6), rep, sep = "|")
+        if (tag %in% done) next
+        SEED_REP_OFFSET <<- as.integer(rep) * 1000000L
+        log_msg("[frontier] axis=%s severity=%s rep=%d / %d", ax, format(val), rep, reps_here)
+        out_dir <- file.path(root, sprintf("%s_%s_rep%03d", ax, vtag, rep))
+        hl <- pipeline_headline_once(out_dir)
+        hl$axis <- ax; hl$severity <- val; hl$rep <- rep; hl$regret_mode <- regret_mode
+        append_csv(hl, per_rep_file)
+        done <- c(done, tag); saveRDS(done, done_file)
+        if (!keep_scratch) unlink(out_dir, recursive = TRUE, force = TRUE)
+      }
+    }
+  }
+
+  if (!file.exists(per_rep_file)) { log_msg("[frontier] no results written"); return(invisible(NULL)) }
+  pr <- read.csv(per_rep_file, stringsAsFactors = FALSE)
+  pr <- pr[!duplicated(pr[, c("axis", "severity", "rep", "score_unit_mode")]), , drop = FALSE]
+  agg <- aggregate_frontier(pr)
+  write.csv(agg, file.path(root, "frontier_summary_v13d.csv"), row.names = FALSE)
+
+  cat("\n=== frontier: debt_threshold vs CUSUM mean ratio (below 1 = beats CUSUM) ===\n")
+  for (ax in unique(agg$axis)) {
+    cat(sprintf("-- axis: %s --\n", ax))
+    sub <- agg[agg$axis == ax, ]
+    for (sv in unique(sub$severity)) {
+      g <- sub[sub$severity == sv, ]
+      rr <- function(m) { z <- g$dt_cusum_ratio_mean[g$score_unit_mode == m]; if (length(z)) z[1] else NA_real_ }
+      fb <- g$frac_deployed_better[1]
+      cat(sprintf("  severity=%-6s  median=%.3f  q75=%.3f  mean=%.3f   [frac_deployed_better=%.3f]\n",
+                  format(sv), rr("median"), rr("q75"), rr("mean"), fb))
+    }
+  }
+
+  cr <- frontier_crossings(agg)
+  write.csv(cr, file.path(root, "frontier_crossings_v13d.csv"), row.names = FALSE)
+  cat("\n=== crossing into a win vs CUSUM (debt_threshold mean ratio < 1) ===\n")
+  for (i in seq_len(nrow(cr))) {
+    c1 <- cr[i, ]
+    if (isTRUE(c1$crosses)) {
+      cat(sprintf("  %-9s %-7s: crosses between severity %s and %s%s\n",
+                  c1$axis, c1$score_unit_mode, format(c1$cross_from_severity), format(c1$cross_to_severity),
+                  if (isTRUE(c1$win_band_excludes_one_at_cross)) "  (5-95 band excludes 1)" else "  (5-95 band straddles 1)"))
+    } else {
+      cat(sprintf("  %-9s %-7s: no crossing (best ratio %.3f at severity %s)\n",
+                  c1$axis, c1$score_unit_mode, c1$best_ratio, format(c1$best_severity)))
+    }
+  }
+  invisible(agg)
+}
+
+# =============================================================================
+# 13. Entry point
+# =============================================================================
+keep_scratch <- Sys.getenv("LD_OUTER_KEEP", unset = "0") != "0"
+
+if (FRONTIER_ON) {
+  rmode <- if (nzchar(REGRET_REQUEST)) REGRET_REQUEST else "signed"
+  message(sprintf("[learning-debt] Frontier sweep: regret=%s, %d reps/point, run_mode=%s, inner cal=%d tune=%d test=%d",
+                  rmode, FRONTIER_REPS, RUN_MODE, N_CAL_PATHS_PER_CELL, N_TUNE_PATHS_PER_CELL, N_TEST_PATHS_PER_CELL))
+  run_frontier(rmode, FRONTIER_REPS, keep_scratch = keep_scratch)
+  message("[learning-debt] Frontier sweep complete.")
+} else if (OUTER_REPS > 0L) {
+  spec <- Sys.getenv("LD_OUTER_CELLS", unset = "signed:wellspec,signed:student_t")
+  parts <- strsplit(spec, ",", fixed = TRUE)[[1]]
+  cells <- list()
+  for (pp in parts) {
+    pp <- trimws(pp); if (!nzchar(pp)) next
+    kv <- strsplit(pp, ":", fixed = TRUE)[[1]]
+    rmode <- tolower(trimws(kv[1])); dmode <- if (length(kv) >= 2) tolower(trimws(kv[2])) else "wellspec"
+    if (!rmode %in% c("positive", "signed")) next
+    if (!dmode %in% DGP_ALL) next
+    cells[[length(cells) + 1L]] <- list(regret = rmode, dgp = dmode)
+  }
+  if (length(cells) == 0L) cells <- list(list(regret = "signed", dgp = "wellspec"), list(regret = "signed", dgp = "student_t"))
+  message(sprintf("[learning-debt] Outer MC: %d reps x %d cells, run_mode=%s", OUTER_REPS, length(cells), RUN_MODE))
+  for (cc in cells) run_outer_mc(cc$regret, cc$dgp, OUTER_REPS, keep_scratch = keep_scratch)
+  message("[learning-debt] Outer MC study complete.")
+} else {
+  regret_modes_to_run <- if (nzchar(REGRET_REQUEST)) REGRET_REQUEST else c("positive", "signed")
+  dgp_modes_to_run    <- if (DGP_REQUEST == "all") DGP_ALL else DGP_REQUEST
+  message(sprintf("[learning-debt] Grid: regret={%s} x dgp={%s}, run_mode=%s",
+                  paste(regret_modes_to_run, collapse = ","), paste(dgp_modes_to_run, collapse = ","), RUN_MODE))
+  for (rm_ in regret_modes_to_run) for (dm_ in dgp_modes_to_run) {
+    message(sprintf("[learning-debt] ===== pipeline: regret=%s dgp=%s =====", rm_, dm_))
+    run_pipeline(rm_, dm_)
   }
 }

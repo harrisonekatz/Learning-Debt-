@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the accompanying manuscript."
+title: "Cost-sensitive retraining via posterior learning debt: replication package"
+authors:
+  - family-names: Katz
+    given-names: Harrison E.
+    affiliation: "Airbnb Inc."
+year: 2026
+repository-code: "https://github.com/harrisonekatz/Learning-Debt-"

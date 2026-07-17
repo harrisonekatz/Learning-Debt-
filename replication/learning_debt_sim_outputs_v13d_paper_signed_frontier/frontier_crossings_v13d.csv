@@ -1,0 +1,10 @@
+"axis","score_unit_mode","crosses","cross_from_severity","cross_to_severity","win_band_excludes_one_at_cross","best_severity","best_ratio"
+"hetero","median",TRUE,1.5,2,FALSE,4,0.980941452595388
+"hetero","q75",FALSE,NA,NA,NA,4,0.916679428886749
+"hetero","mean",FALSE,NA,NA,NA,4,0.903263003005377
+"nonlinear","median",FALSE,NA,NA,NA,0,1.01787047830343
+"nonlinear","q75",FALSE,NA,NA,NA,0,0.9521163538893
+"nonlinear","mean",FALSE,NA,NA,NA,0,0.949811920149409
+"tail","median",TRUE,8,6,FALSE,4,0.964863177340878
+"tail","q75",FALSE,NA,NA,NA,4,0.911018909990265
+"tail","mean",FALSE,NA,NA,NA,4,0.907479323360912
